@@ -35,6 +35,18 @@ except Exception:
 MINIMAX_T2A_URL = "https://api.minimax.io/v1/t2a_v2"
 DEFAULT_MODEL = "speech-2.8-turbo"
 DEFAULT_VOICE_ID = "male-qn-qingse"
+VOICE_PRESETS = [
+    ("male-qn-qingse", "青涩男声"),
+    ("male-qn-jingying", "精英男声"),
+    ("male-qn-badao", "霸道男声"),
+    ("female-shaonv", "少女女声"),
+    ("female-yujie", "御姐女声"),
+    ("female-tianmei", "甜美女声"),
+    ("presenter_male", "男播音员"),
+    ("presenter_female", "女播音员"),
+    ("audiobook_male_1", "男有声书"),
+    ("audiobook_female_1", "女有声书"),
+]
 DEFAULT_SPEED = 1.0
 DEFAULT_VOLUME = 1.0
 DEFAULT_PITCH = 0
@@ -179,6 +191,19 @@ def normalize_enhancement_mode(mode):
     return mode if mode in ENHANCEMENT_MODES else DEFAULT_ENHANCEMENT_MODE
 
 
+def normalize_voice_id(voice_id):
+    voice_id = str(voice_id or "").strip()
+    return voice_id or DEFAULT_VOICE_ID
+
+
+def voice_preset_label(voice_id):
+    voice_id = normalize_voice_id(voice_id)
+    for preset_id, label in VOICE_PRESETS:
+        if preset_id == voice_id:
+            return label
+    return None
+
+
 def split_sentences(text):
     return [part.strip() for part in re.split(r"(?<=[。！？!?；;])\s*", text) if part.strip()]
 
@@ -275,7 +300,7 @@ def build_t2a_payload(text, config):
         "language_boost": "auto",
         "output_format": "hex",
         "voice_setting": {
-            "voice_id": config.get("voice_id") or DEFAULT_VOICE_ID,
+            "voice_id": normalize_voice_id(config.get("voice_id", DEFAULT_VOICE_ID)),
             "speed": normalize_speed(config.get("speed", DEFAULT_SPEED)),
             "vol": float(config.get("volume", DEFAULT_VOLUME)),
             "pitch": int(config.get("pitch", DEFAULT_PITCH)),
@@ -428,7 +453,8 @@ class ClipboardReader(rumps.App):
 
         self.settings_menu = rumps.MenuItem("设置")
         self.api_key_item = rumps.MenuItem("设置 MiniMax API Key", callback=self._menu_callback("设置 API Key", self.set_api_key))
-        self.voice_item = rumps.MenuItem("设置声音 Voice ID", callback=self._menu_callback("设置声音", self.set_voice_id))
+        self.voice_menu = rumps.MenuItem("声音 Voice ID")
+        self._rebuild_voice_menu()
         self.model_item = rumps.MenuItem("设置模型", callback=self._menu_callback("设置模型", self.set_model))
         self.speed_menu = rumps.MenuItem("语速")
         self._rebuild_speed_menu()
@@ -438,7 +464,7 @@ class ClipboardReader(rumps.App):
         self._update_launch_at_login_item()
 
         self.settings_menu.add(self.api_key_item)
-        self.settings_menu.add(self.voice_item)
+        self.settings_menu.add(self.voice_menu)
         self.settings_menu.add(self.model_item)
         self.settings_menu.add(self.speed_menu)
         self.settings_menu.add(self.enhancement_menu)
@@ -480,6 +506,26 @@ class ClipboardReader(rumps.App):
             item.state = mode == current
             item._enhancement_mode = mode
             self.enhancement_menu.add(item)
+
+    def _rebuild_voice_menu(self):
+        if getattr(self.voice_menu, "_menu", None) is not None:
+            self.voice_menu.clear()
+        current = normalize_voice_id(self.config.get("voice_id", DEFAULT_VOICE_ID))
+        current_is_preset = False
+        for voice_id, label in VOICE_PRESETS:
+            title = f"{label} · {voice_id}"
+            item = rumps.MenuItem(title, callback=self._menu_callback(f"声音 {label}", self.set_voice_preset))
+            item.state = voice_id == current
+            item._voice_id = voice_id
+            current_is_preset = current_is_preset or item.state
+            self.voice_menu.add(item)
+        if not current_is_preset:
+            self.voice_menu.add(None)
+            current_item = rumps.MenuItem(f"当前自定义 · {current}", callback=None)
+            current_item.state = True
+            self.voice_menu.add(current_item)
+        self.voice_menu.add(None)
+        self.voice_menu.add(rumps.MenuItem("自定义 Voice ID…", callback=self._menu_callback("自定义声音", self.set_custom_voice_id)))
 
     def _set_status(self, text):
         self.last_status = text
@@ -570,19 +616,28 @@ class ClipboardReader(rumps.App):
             self._save_config()
             self._set_status("API Key 已保存")
 
-    def set_voice_id(self, _):
+    def set_voice_preset(self, sender):
+        voice_id = normalize_voice_id(getattr(sender, "_voice_id", None))
+        self.config["voice_id"] = voice_id
+        self._save_config()
+        self._rebuild_voice_menu()
+        label = voice_preset_label(voice_id) or voice_id
+        self._set_status(f"声音: {label}")
+
+    def set_custom_voice_id(self, _):
         win = rumps.Window(
             message="填入 MiniMax voice_id。",
             title="声音 Voice ID",
-            default_text=self.config.get("voice_id", DEFAULT_VOICE_ID),
+            default_text=normalize_voice_id(self.config.get("voice_id", DEFAULT_VOICE_ID)),
             ok="保存",
             cancel="取消",
             dimensions=(360, 24),
         )
         response = win.run()
         if response.clicked and response.text.strip():
-            self.config["voice_id"] = response.text.strip()
+            self.config["voice_id"] = normalize_voice_id(response.text)
             self._save_config()
+            self._rebuild_voice_menu()
             self._set_status(f"声音: {self.config['voice_id']}")
 
     def set_model(self, _):

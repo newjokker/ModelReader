@@ -3,11 +3,14 @@ import unittest
 from clipboard_reader import (
     DEFAULT_MODEL,
     DEFAULT_VOICE_ID,
+    VOICE_PRESETS,
     build_t2a_payload,
     enhance_text_for_tts,
     has_tts_markup,
+    normalize_voice_id,
     normalize_speed,
     trim_text_for_tts,
+    voice_preset_label,
 )
 
 
@@ -28,6 +31,14 @@ class ClipboardReaderTests(unittest.TestCase):
         self.assertEqual(payload["voice_setting"]["voice_id"], DEFAULT_VOICE_ID)
         self.assertEqual(payload["audio_setting"]["format"], "mp3")
         self.assertEqual(payload["output_format"], "hex")
+
+    def test_default_voice_is_in_presets(self):
+        self.assertIn(DEFAULT_VOICE_ID, [voice_id for voice_id, _label in VOICE_PRESETS])
+        self.assertEqual(voice_preset_label(DEFAULT_VOICE_ID), "青涩男声")
+
+    def test_normalize_voice_id_falls_back_to_default(self):
+        self.assertEqual(normalize_voice_id(""), DEFAULT_VOICE_ID)
+        self.assertEqual(normalize_voice_id(" custom-voice "), "custom-voice")
 
     def test_plain_enhancement_mode_keeps_text(self):
         text = "你好世界。"
