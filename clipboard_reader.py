@@ -39,6 +39,19 @@ DEFAULT_SPEED = 1.0
 DEFAULT_VOLUME = 1.0
 DEFAULT_PITCH = 0
 MAX_TEXT_LENGTH = 10000
+DEFAULT_ENHANCEMENT_MODE = "auto"
+ENHANCEMENT_MODES = {
+    "plain": "原文朗读",
+    "auto": "自动增强",
+    "gentle": "温柔",
+    "energetic": "坚定",
+    "news": "新闻播报",
+    "suspense": "悬疑",
+}
+TTS_MARKUP_RE = re.compile(
+    r"<#\d+(?:\.\d+)?#>|\((?:laughs|sighs|breath|exhale|gasps|emm)\)",
+    re.IGNORECASE,
+)
 
 APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/ClipboardReader")
 CONFIG_FILE = os.path.join(APP_SUPPORT_DIR, "config.json")
@@ -155,6 +168,79 @@ def trim_text_for_tts(text, max_length=MAX_TEXT_LENGTH):
     if len(text) <= max_length:
         return text, False
     return text[:max_length].rstrip(), True
+
+
+def has_tts_markup(text):
+    return bool(TTS_MARKUP_RE.search(text or ""))
+
+
+def normalize_enhancement_mode(mode):
+    mode = str(mode or "").strip()
+    return mode if mode in ENHANCEMENT_MODES else DEFAULT_ENHANCEMENT_MODE
+
+
+def split_sentences(text):
+    return [part.strip() for part in re.split(r"(?<=[。！？!?；;])\s*", text) if part.strip()]
+
+
+def pause_for_sentence(sentence, mode):
+    if sentence.endswith(("？", "?")):
+        return "<#0.5#>"
+    if sentence.endswith(("！", "!")):
+        return "<#0.45#>"
+    if mode in {"gentle", "suspense"}:
+        return "<#0.65#>"
+    if mode == "news":
+        return "<#0.3#>"
+    return "<#0.4#>"
+
+
+def detect_enhancement_mode(text):
+    if re.search(r"(^|\n)\s*[^:\n：]{1,8}[:：]", text):
+        return "energetic"
+    if re.search(r"等等|不对劲|忽然|突然|安静|错误|藏|发现|线索", text):
+        return "suspense"
+    if re.search(r"没关系|累|珍贵|离开|安静|温柔|慢慢|照顾", text):
+        return "gentle"
+    if re.search(r"今天|上午|消息|表示|目前|完成|发布|测试人员", text):
+        return "news"
+    if re.search(r"成了|成功|太好了|漂亮|开工|继续|坚持", text):
+        return "energetic"
+    return "plain"
+
+
+def enhance_paragraph(paragraph, mode):
+    sentences = split_sentences(paragraph)
+    if not sentences:
+        return paragraph.strip()
+
+    enhanced = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        enhanced.append(f"{sentence}{pause_for_sentence(sentence, mode)}")
+
+    text = "\n".join(enhanced).strip()
+    if mode == "gentle":
+        return f"(breath) {text}"
+    if mode == "suspense":
+        return f"{text}\n(breath)"
+    if mode == "energetic" and any(s.endswith(("！", "!")) for s in sentences):
+        return f"{text}\n(laughs)"
+    return text
+
+
+def enhance_text_for_tts(text, mode=DEFAULT_ENHANCEMENT_MODE):
+    text = normalize_text(text)
+    mode = normalize_enhancement_mode(mode)
+    if not text or mode == "plain" or has_tts_markup(text):
+        return text
+
+    effective_mode = detect_enhancement_mode(text) if mode == "auto" else mode
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    enhanced = [enhance_paragraph(paragraph, effective_mode) for paragraph in paragraphs]
+    return "\n\n".join(enhanced)
 
 
 def normalize_speed(value):
@@ -306,6 +392,7 @@ class ClipboardReader(rumps.App):
             "speed": DEFAULT_SPEED,
             "volume": DEFAULT_VOLUME,
             "pitch": DEFAULT_PITCH,
+            "enhancement_mode": DEFAULT_ENHANCEMENT_MODE,
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -345,6 +432,8 @@ class ClipboardReader(rumps.App):
         self.model_item = rumps.MenuItem("设置模型", callback=self._menu_callback("设置模型", self.set_model))
         self.speed_menu = rumps.MenuItem("语速")
         self._rebuild_speed_menu()
+        self.enhancement_menu = rumps.MenuItem("朗读模式")
+        self._rebuild_enhancement_menu()
         self.launch_at_login_item = rumps.MenuItem("开机自启", callback=self._menu_callback("开机自启", self.toggle_launch_at_login))
         self._update_launch_at_login_item()
 
@@ -352,6 +441,7 @@ class ClipboardReader(rumps.App):
         self.settings_menu.add(self.voice_item)
         self.settings_menu.add(self.model_item)
         self.settings_menu.add(self.speed_menu)
+        self.settings_menu.add(self.enhancement_menu)
         self.settings_menu.add(None)
         self.settings_menu.add(self.launch_at_login_item)
 
@@ -381,6 +471,16 @@ class ClipboardReader(rumps.App):
             item.state = speed == current
             self.speed_menu.add(item)
 
+    def _rebuild_enhancement_menu(self):
+        if getattr(self.enhancement_menu, "_menu", None) is not None:
+            self.enhancement_menu.clear()
+        current = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
+        for mode, label in ENHANCEMENT_MODES.items():
+            item = rumps.MenuItem(label, callback=self._menu_callback(f"朗读模式 {label}", self.set_enhancement_mode))
+            item.state = mode == current
+            item._enhancement_mode = mode
+            self.enhancement_menu.add(item)
+
     def _set_status(self, text):
         self.last_status = text
         self.status_item.title = f"状态: {text}"
@@ -398,10 +498,13 @@ class ClipboardReader(rumps.App):
             if not self._has_api_key():
                 return
 
-        text, was_trimmed = trim_text_for_tts(get_clipboard_text())
-        if not text:
+        raw_text = normalize_text(get_clipboard_text())
+        if not raw_text:
             safe_alert(title="剪贴板没有文字", message="先复制一段文字，再点击「朗读剪贴板」。")
             return
+        mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
+        enhanced_text = enhance_text_for_tts(raw_text, mode)
+        text, was_trimmed = trim_text_for_tts(enhanced_text)
 
         self.busy = True
         self.read_item.set_callback(None)
@@ -504,6 +607,13 @@ class ClipboardReader(rumps.App):
         self._rebuild_speed_menu()
         self._set_status(f"语速: {self.config['speed']:g}x")
 
+    def set_enhancement_mode(self, sender):
+        mode = normalize_enhancement_mode(getattr(sender, "_enhancement_mode", None))
+        self.config["enhancement_mode"] = mode
+        self._save_config()
+        self._rebuild_enhancement_menu()
+        self._set_status(f"模式: {ENHANCEMENT_MODES[mode]}")
+
     def toggle_launch_at_login(self, _):
         if is_launch_agent_enabled():
             uninstall_launch_agent()
@@ -531,7 +641,8 @@ class ClipboardReader(rumps.App):
                 "技术路线: 剪贴板 -> MiniMax T2A -> afplay\n"
                 f"API Key 来源: {source}\n"
                 f"模型: {self.config.get('model', DEFAULT_MODEL)}\n"
-                f"声音: {self.config.get('voice_id', DEFAULT_VOICE_ID)}"
+                f"声音: {self.config.get('voice_id', DEFAULT_VOICE_ID)}\n"
+                f"朗读模式: {ENHANCEMENT_MODES[normalize_enhancement_mode(self.config.get('enhancement_mode'))]}"
             ),
         )
 

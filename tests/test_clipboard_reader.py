@@ -4,6 +4,8 @@ from clipboard_reader import (
     DEFAULT_MODEL,
     DEFAULT_VOICE_ID,
     build_t2a_payload,
+    enhance_text_for_tts,
+    has_tts_markup,
     normalize_speed,
     trim_text_for_tts,
 )
@@ -26,6 +28,20 @@ class ClipboardReaderTests(unittest.TestCase):
         self.assertEqual(payload["voice_setting"]["voice_id"], DEFAULT_VOICE_ID)
         self.assertEqual(payload["audio_setting"]["format"], "mp3")
         self.assertEqual(payload["output_format"], "hex")
+
+    def test_plain_enhancement_mode_keeps_text(self):
+        text = "你好世界。"
+        self.assertEqual(enhance_text_for_tts(text, "plain"), text)
+
+    def test_auto_enhancement_preserves_existing_markup(self):
+        text = "等等，<#0.4#>这里不对劲。(gasps)"
+        self.assertEqual(enhance_text_for_tts(text, "auto"), text)
+
+    def test_auto_enhancement_adds_tts_markup(self):
+        enhanced = enhance_text_for_tts("等等，这里不对劲。线索终于出来了！", "auto")
+        self.assertTrue(has_tts_markup(enhanced))
+        self.assertIn("<#0.65#>", enhanced)
+        self.assertIn("(breath)", enhanced)
 
 
 if __name__ == "__main__":
