@@ -28,8 +28,10 @@ from app_version import __version__
 
 try:
     import AppKit
+    import objc
 except Exception:
     AppKit = None
+    objc = None
 
 
 MINIMAX_T2A_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -73,6 +75,22 @@ ERROR_LOG_FILE = os.path.join(ERROR_LOG_DIR, "error.log")
 LAUNCH_AGENT_LABEL = __bundle_id__
 LAUNCH_AGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
 LAUNCH_AGENT_FILE = os.path.join(LAUNCH_AGENT_DIR, f"{LAUNCH_AGENT_LABEL}.plist")
+
+
+if AppKit is not None and objc is not None:
+    class _TextServiceProvider(AppKit.NSObject):
+        """macOS Services provider: receives selected text from right-click Services."""
+
+        def readSelection_userData_error_(self, pasteboard, user_data, error):
+            text = pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
+            if not text and hasattr(AppKit, "NSStringPboardType"):
+                text = pasteboard.stringForType_(AppKit.NSStringPboardType)
+            if not text:
+                safe_notification(title=__app_name__, subtitle="没有可朗读文本", message="请先选中一段文字。")
+                return
+            self.reader_app.speak_text(str(text), source="所选文本")
+else:
+    _TextServiceProvider = None
 
 
 def ensure_dir(path):
@@ -403,10 +421,12 @@ class ClipboardReader(rumps.App):
         self.config = self._load_config()
         self.play_process = None
         self.worker = None
+        self.service_provider = None
         self.busy = False
         self.last_audio_path = None
         self.last_status = "待命"
         self._build_menu()
+        self._register_services_provider()
         self._set_status("待命")
 
     def _load_config(self):
@@ -536,6 +556,9 @@ class ClipboardReader(rumps.App):
         return bool((self.config.get("api_key") or os.environ.get("MINIMAX_API_KEY") or "").strip())
 
     def read_clipboard(self, _):
+        self.speak_text(get_clipboard_text(), source="剪贴板")
+
+    def speak_text(self, raw_text, source="文本"):
         if self.busy:
             safe_notification(title=__app_name__, subtitle="正在生成", message="上一段朗读还没处理完。")
             return
@@ -544,9 +567,9 @@ class ClipboardReader(rumps.App):
             if not self._has_api_key():
                 return
 
-        raw_text = normalize_text(get_clipboard_text())
+        raw_text = normalize_text(raw_text)
         if not raw_text:
-            safe_alert(title="剪贴板没有文字", message="先复制一段文字，再点击「朗读剪贴板」。")
+            safe_alert(title="没有可朗读文字", message="请先复制或选中一段文字。")
             return
         mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
         enhanced_text = enhance_text_for_tts(raw_text, mode)
@@ -554,7 +577,7 @@ class ClipboardReader(rumps.App):
 
         self.busy = True
         self.read_item.set_callback(None)
-        self._set_status("生成中")
+        self._set_status(f"生成中 · {source}")
         self.worker = threading.Thread(
             target=self._generate_and_play,
             args=(text, was_trimmed),
@@ -562,6 +585,18 @@ class ClipboardReader(rumps.App):
             daemon=True,
         )
         self.worker.start()
+
+    def _register_services_provider(self):
+        if _TextServiceProvider is None or AppKit is None:
+            return
+        try:
+            self.service_provider = _TextServiceProvider.alloc().init()
+            self.service_provider.reader_app = self
+            AppKit.NSApplication.sharedApplication().setServicesProvider_(self.service_provider)
+            if hasattr(AppKit, "NSUpdateDynamicServices"):
+                AppKit.NSUpdateDynamicServices()
+        except Exception as e:
+            log_exception("注册右键服务失败", e)
 
     def _generate_and_play(self, text, was_trimmed):
         try:

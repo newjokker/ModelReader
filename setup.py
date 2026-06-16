@@ -25,6 +25,17 @@ OPTIONS = {
         "NSHumanReadableCopyright": "Copyright © 2026. All rights reserved.",
         "LSUIElement": True,
         "NSAppleEventsUsageDescription": "用于读取剪贴板文字并朗读。",
+        "NSServices": [
+            {
+                "NSMenuItem": {
+                    "default": "朗读所选文本",
+                },
+                "NSMessage": "readSelection",
+                "NSPortName": "剪贴板朗读",
+                "NSSendTypes": ["NSStringPboardType"],
+                "NSReturnTypes": [],
+            },
+        ],
     },
     "packages": ["rumps"],
     "includes": ["ctypes", "AppKit", "Foundation", "objc"],
