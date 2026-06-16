@@ -13,6 +13,7 @@ DATA_FILES = []
 VERSION = __version__
 OPTIONS = {
     "argv_emulation": False,
+    "iconfile": "icon.icns",
     "plist": {
         "CFBundleName": "剪贴板朗读",
         "CFBundleDisplayName": "📋 剪贴板朗读",
