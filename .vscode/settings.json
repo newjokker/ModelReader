@@ -1,0 +1,8 @@
+{
+  "files.exclude": {
+    "**/._*": true,
+    "**/.DS_Store": true,
+    "**/__pycache__": true,
+    ".eggs": true
+  }
+}

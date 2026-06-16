@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools", "py2app"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "clipboard-reader"
+dynamic = ["version"]
+description = "macOS 菜单栏剪贴板 MiniMax 朗读工具"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "newjokker"},
+]
+keywords = ["tts", "minimax", "macos", "menubar", "clipboard"]
+classifiers = [
+    "Environment :: MacOS X :: Cocoa",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+]

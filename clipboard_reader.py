@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""
+📋 剪贴板朗读 - macOS 菜单栏朗读工具
+
+流程:
+    复制文字 -> 点击菜单栏「朗读剪贴板」-> MiniMax T2A -> afplay 自动播放
+"""
+
+__app_name__ = "📋 剪贴板朗读"
+__bundle_id__ = "com.clipboardreader.app"
+
+import datetime
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+import urllib.error
+import urllib.request
+
+import rumps
+
+from app_version import __version__
+
+try:
+    import AppKit
+except Exception:
+    AppKit = None
+
+
+MINIMAX_T2A_URL = "https://api.minimax.io/v1/t2a_v2"
+DEFAULT_MODEL = "speech-2.8-turbo"
+DEFAULT_VOICE_ID = "male-qn-qingse"
+DEFAULT_SPEED = 1.0
+DEFAULT_VOLUME = 1.0
+DEFAULT_PITCH = 0
+MAX_TEXT_LENGTH = 10000
+
+APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/ClipboardReader")
+CONFIG_FILE = os.path.join(APP_SUPPORT_DIR, "config.json")
+AUDIO_CACHE_DIR = os.path.join(APP_SUPPORT_DIR, "Audio")
+ERROR_LOG_DIR = os.path.expanduser("~/Library/Logs/ClipboardReader")
+ERROR_LOG_FILE = os.path.join(ERROR_LOG_DIR, "error.log")
+LAUNCH_AGENT_LABEL = __bundle_id__
+LAUNCH_AGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
+LAUNCH_AGENT_FILE = os.path.join(LAUNCH_AGENT_DIR, f"{LAUNCH_AGENT_LABEL}.plist")
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def atomic_write_json(path, data):
+    directory = os.path.dirname(path) or "."
+    ensure_dir(directory)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        dir=directory,
+        delete=False,
+    )
+    try:
+        json.dump(data, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    finally:
+        tmp.close()
+    os.replace(tmp.name, path)
+
+
+def write_error_log(context, exc_info=None, message=None):
+    try:
+        ensure_dir(ERROR_LOG_DIR)
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "=" * 80,
+            f"[{now}] {context}",
+            f"Version: {__version__}",
+        ]
+        if message:
+            lines.append(str(message))
+        if exc_info:
+            lines.append("Traceback:")
+            lines.extend(traceback.format_exception(*exc_info))
+        lines.append("")
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return ERROR_LOG_FILE
+    except Exception as log_error:
+        sys.stderr.write(f"[ClipboardReader] 写入错误日志失败: {log_error}\n")
+        return None
+
+
+def log_exception(context, exc):
+    return write_error_log(context, (type(exc), exc, exc.__traceback__))
+
+
+def install_exception_logging():
+    original_excepthook = sys.excepthook
+
+    def _excepthook(exc_type, exc, tb):
+        if exc_type is KeyboardInterrupt:
+            original_excepthook(exc_type, exc, tb)
+            return
+        write_error_log("未处理异常", (exc_type, exc, tb))
+        original_excepthook(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+    if hasattr(threading, "excepthook"):
+        original_threading_excepthook = threading.excepthook
+
+        def _threading_excepthook(args):
+            write_error_log(
+                f"线程未处理异常: {getattr(args.thread, 'name', 'unknown')}",
+                (args.exc_type, args.exc_value, args.exc_traceback),
+            )
+            original_threading_excepthook(args)
+
+        threading.excepthook = _threading_excepthook
+
+
+def safe_alert(**kwargs):
+    try:
+        return rumps.alert(**kwargs)
+    except Exception as e:
+        log_exception("显示提示框失败", e)
+        return None
+
+
+def safe_notification(**kwargs):
+    try:
+        rumps.notification(**kwargs)
+    except Exception as e:
+        log_exception("发送系统通知失败", e)
+
+
+def normalize_text(text):
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def trim_text_for_tts(text, max_length=MAX_TEXT_LENGTH):
+    text = normalize_text(text)
+    if len(text) <= max_length:
+        return text, False
+    return text[:max_length].rstrip(), True
+
+
+def normalize_speed(value):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SPEED
+    return min(2.0, max(0.5, round(speed, 2)))
+
+
+def get_clipboard_text():
+    if AppKit is not None:
+        pasteboard = AppKit.NSPasteboard.generalPasteboard()
+        text = pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
+        if text:
+            return str(text)
+
+    result = subprocess.run(
+        ["pbpaste"],
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    return result.stdout
+
+
+def build_t2a_payload(text, config):
+    return {
+        "model": config.get("model") or DEFAULT_MODEL,
+        "text": text,
+        "stream": False,
+        "language_boost": "auto",
+        "output_format": "hex",
+        "voice_setting": {
+            "voice_id": config.get("voice_id") or DEFAULT_VOICE_ID,
+            "speed": normalize_speed(config.get("speed", DEFAULT_SPEED)),
+            "vol": float(config.get("volume", DEFAULT_VOLUME)),
+            "pitch": int(config.get("pitch", DEFAULT_PITCH)),
+        },
+        "audio_setting": {
+            "sample_rate": 32000,
+            "bitrate": 128000,
+            "format": "mp3",
+            "channel": 1,
+        },
+    }
+
+
+def minimax_t2a(text, config):
+    api_key = (config.get("api_key") or os.environ.get("MINIMAX_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("还没有配置 MiniMax API Key")
+
+    body = json.dumps(build_t2a_payload(text, config), ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        MINIMAX_T2A_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        details = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"MiniMax 请求失败: HTTP {e.code} {details}") from e
+
+    base_resp = data.get("base_resp") or {}
+    status_code = base_resp.get("status_code", 0)
+    if status_code not in (0, "0", None):
+        status_msg = base_resp.get("status_msg") or "unknown error"
+        raise RuntimeError(f"MiniMax 返回错误 {status_code}: {status_msg}")
+
+    audio_hex = (data.get("data") or {}).get("audio")
+    if not audio_hex:
+        raise RuntimeError(f"MiniMax 没有返回音频数据: {data}")
+
+    return bytes.fromhex(audio_hex), data
+
+
+def save_audio(audio_bytes):
+    ensure_dir(AUDIO_CACHE_DIR)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(AUDIO_CACHE_DIR, f"clipboard-{timestamp}.mp3")
+    with open(path, "wb") as f:
+        f.write(audio_bytes)
+    return path
+
+
+def get_running_app_path():
+    marker = ".app/Contents/"
+    executable = os.path.abspath(sys.argv[0])
+    if marker not in executable:
+        return None
+    return executable.split(marker, 1)[0] + ".app"
+
+
+def build_launch_agent_plist(app_path):
+    return {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": ["/usr/bin/open", "-gj", app_path],
+        "RunAtLoad": True,
+        "KeepAlive": False,
+    }
+
+
+def install_launch_agent(app_path=None):
+    if app_path is None:
+        app_path = get_running_app_path()
+    if not app_path:
+        raise RuntimeError("当前不是打包后的 .app，无法设置开机自启")
+    ensure_dir(LAUNCH_AGENT_DIR)
+    with open(LAUNCH_AGENT_FILE, "wb") as f:
+        plistlib.dump(build_launch_agent_plist(app_path), f)
+
+
+def uninstall_launch_agent():
+    if os.path.exists(LAUNCH_AGENT_FILE):
+        os.remove(LAUNCH_AGENT_FILE)
+
+
+def is_launch_agent_enabled():
+    return os.path.exists(LAUNCH_AGENT_FILE)
+
+
+class ClipboardReader(rumps.App):
+    """菜单栏剪贴板朗读应用。"""
+
+    def __init__(self):
+        super().__init__("🔊", quit_button=None)
+        self.config = self._load_config()
+        self.play_process = None
+        self.worker = None
+        self.busy = False
+        self.last_audio_path = None
+        self.last_status = "待命"
+        self._build_menu()
+        self._set_status("待命")
+
+    def _load_config(self):
+        config = {
+            "api_key": "",
+            "model": DEFAULT_MODEL,
+            "voice_id": DEFAULT_VOICE_ID,
+            "speed": DEFAULT_SPEED,
+            "volume": DEFAULT_VOLUME,
+            "pitch": DEFAULT_PITCH,
+        }
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                if isinstance(saved, dict):
+                    config.update(saved)
+            except (json.JSONDecodeError, OSError) as e:
+                log_exception("加载配置失败", e)
+        return config
+
+    def _save_config(self):
+        try:
+            atomic_write_json(CONFIG_FILE, self.config)
+        except OSError as e:
+            log_exception("保存配置失败", e)
+
+    def _menu_callback(self, label, callback):
+        def _wrapped(sender):
+            try:
+                return callback(sender)
+            except Exception as e:
+                log_exception(f"菜单操作失败: {label}", e)
+                safe_alert(title="操作失败", message=f"「{label}」执行失败，详情已写入错误日志。")
+                return None
+
+        return _wrapped
+
+    def _build_menu(self):
+        self.read_item = rumps.MenuItem("朗读剪贴板", callback=self._menu_callback("朗读剪贴板", self.read_clipboard))
+        self.stop_item = rumps.MenuItem("停止播放", callback=self._menu_callback("停止播放", self.stop_playback))
+        self.status_item = rumps.MenuItem("状态: 待命", callback=None)
+
+        self.settings_menu = rumps.MenuItem("设置")
+        self.api_key_item = rumps.MenuItem("设置 MiniMax API Key", callback=self._menu_callback("设置 API Key", self.set_api_key))
+        self.voice_item = rumps.MenuItem("设置声音 Voice ID", callback=self._menu_callback("设置声音", self.set_voice_id))
+        self.model_item = rumps.MenuItem("设置模型", callback=self._menu_callback("设置模型", self.set_model))
+        self.speed_menu = rumps.MenuItem("语速")
+        self._rebuild_speed_menu()
+        self.launch_at_login_item = rumps.MenuItem("开机自启", callback=self._menu_callback("开机自启", self.toggle_launch_at_login))
+        self._update_launch_at_login_item()
+
+        self.settings_menu.add(self.api_key_item)
+        self.settings_menu.add(self.voice_item)
+        self.settings_menu.add(self.model_item)
+        self.settings_menu.add(self.speed_menu)
+        self.settings_menu.add(None)
+        self.settings_menu.add(self.launch_at_login_item)
+
+        self.open_cache_item = rumps.MenuItem("打开音频缓存", callback=self._menu_callback("打开音频缓存", self.open_audio_cache))
+        self.open_logs_item = rumps.MenuItem("打开错误日志", callback=self._menu_callback("打开错误日志", self.open_error_logs))
+
+        self.menu = [
+            self.read_item,
+            self.stop_item,
+            None,
+            self.status_item,
+            None,
+            self.settings_menu,
+            self.open_cache_item,
+            self.open_logs_item,
+            None,
+            rumps.MenuItem("关于", callback=self._menu_callback("关于", self.show_about)),
+            rumps.MenuItem("退出", callback=self._menu_callback("退出", self.quit_app)),
+        ]
+
+    def _rebuild_speed_menu(self):
+        self.speed_menu.clear()
+        current = normalize_speed(self.config.get("speed", DEFAULT_SPEED))
+        for speed in [0.75, 0.9, 1.0, 1.1, 1.25, 1.5]:
+            item = rumps.MenuItem(f"{speed:g}x", callback=self._menu_callback(f"语速 {speed:g}x", self.set_speed))
+            item.state = speed == current
+            self.speed_menu.add(item)
+
+    def _set_status(self, text):
+        self.last_status = text
+        self.status_item.title = f"状态: {text}"
+        self.title = "🔊…" if self.busy else "🔊"
+
+    def _has_api_key(self):
+        return bool((self.config.get("api_key") or os.environ.get("MINIMAX_API_KEY") or "").strip())
+
+    def read_clipboard(self, _):
+        if self.busy:
+            safe_notification(title=__app_name__, subtitle="正在生成", message="上一段朗读还没处理完。")
+            return
+        if not self._has_api_key():
+            self.set_api_key(None)
+            if not self._has_api_key():
+                return
+
+        text, was_trimmed = trim_text_for_tts(get_clipboard_text())
+        if not text:
+            safe_alert(title="剪贴板没有文字", message="先复制一段文字，再点击「朗读剪贴板」。")
+            return
+
+        self.busy = True
+        self.read_item.set_callback(None)
+        self._set_status("生成中")
+        self.worker = threading.Thread(
+            target=self._generate_and_play,
+            args=(text, was_trimmed),
+            name="MiniMaxTTSWorker",
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _generate_and_play(self, text, was_trimmed):
+        try:
+            if was_trimmed:
+                safe_notification(title=__app_name__, subtitle="文本过长", message="已截取前 10000 个字符朗读。")
+            audio_bytes, response = minimax_t2a(text, self.config)
+            audio_path = save_audio(audio_bytes)
+            self.last_audio_path = audio_path
+            self._start_playback(audio_path)
+            usage = (response.get("extra_info") or {}).get("usage_characters", len(text))
+            self._set_status(f"播放中 · {usage} 字")
+            safe_notification(title=__app_name__, subtitle="开始播放", message="MiniMax 语音已生成。")
+        except Exception as e:
+            log_exception("朗读剪贴板失败", e)
+            self._set_status("失败")
+            safe_alert(title="朗读失败", message=f"{e}\n\n详情已写入错误日志。")
+        finally:
+            self.busy = False
+            self.read_item.set_callback(self._menu_callback("朗读剪贴板", self.read_clipboard))
+            self.title = "🔊"
+
+    def _start_playback(self, audio_path):
+        self._stop_playback_process()
+        self.play_process = subprocess.Popen(["afplay", audio_path])
+
+    def _stop_playback_process(self):
+        if self.play_process is not None and self.play_process.poll() is None:
+            self.play_process.terminate()
+            try:
+                self.play_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.play_process.kill()
+        self.play_process = None
+
+    def stop_playback(self, _):
+        self._stop_playback_process()
+        self._set_status("已停止")
+
+    def set_api_key(self, _):
+        default = self.config.get("api_key", "")
+        win = rumps.Window(
+            message="填入 MiniMax API Key。也可以不保存，改用环境变量 MINIMAX_API_KEY。",
+            title="MiniMax API Key",
+            default_text=default,
+            ok="保存",
+            cancel="取消",
+            dimensions=(420, 24),
+        )
+        response = win.run()
+        if response.clicked:
+            self.config["api_key"] = response.text.strip()
+            self._save_config()
+            self._set_status("API Key 已保存")
+
+    def set_voice_id(self, _):
+        win = rumps.Window(
+            message="填入 MiniMax voice_id。",
+            title="声音 Voice ID",
+            default_text=self.config.get("voice_id", DEFAULT_VOICE_ID),
+            ok="保存",
+            cancel="取消",
+            dimensions=(360, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            self.config["voice_id"] = response.text.strip()
+            self._save_config()
+            self._set_status(f"声音: {self.config['voice_id']}")
+
+    def set_model(self, _):
+        win = rumps.Window(
+            message="常用: speech-2.8-turbo / speech-2.8-hd / speech-2.6-turbo",
+            title="MiniMax 模型",
+            default_text=self.config.get("model", DEFAULT_MODEL),
+            ok="保存",
+            cancel="取消",
+            dimensions=(360, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            self.config["model"] = response.text.strip()
+            self._save_config()
+            self._set_status(f"模型: {self.config['model']}")
+
+    def set_speed(self, sender):
+        text = sender.title.replace("x", "")
+        self.config["speed"] = normalize_speed(text)
+        self._save_config()
+        self._rebuild_speed_menu()
+        self._set_status(f"语速: {self.config['speed']:g}x")
+
+    def toggle_launch_at_login(self, _):
+        if is_launch_agent_enabled():
+            uninstall_launch_agent()
+        else:
+            install_launch_agent()
+        self._update_launch_at_login_item()
+
+    def _update_launch_at_login_item(self):
+        self.launch_at_login_item.state = is_launch_agent_enabled()
+
+    def open_audio_cache(self, _):
+        ensure_dir(AUDIO_CACHE_DIR)
+        subprocess.run(["open", AUDIO_CACHE_DIR], check=False)
+
+    def open_error_logs(self, _):
+        ensure_dir(ERROR_LOG_DIR)
+        subprocess.run(["open", ERROR_LOG_DIR], check=False)
+
+    def show_about(self, _):
+        source = "环境变量 MINIMAX_API_KEY" if os.environ.get("MINIMAX_API_KEY") else "本地配置"
+        safe_alert(
+            title=__app_name__,
+            message=(
+                f"版本: {__version__}\n"
+                "技术路线: 剪贴板 -> MiniMax T2A -> afplay\n"
+                f"API Key 来源: {source}\n"
+                f"模型: {self.config.get('model', DEFAULT_MODEL)}\n"
+                f"声音: {self.config.get('voice_id', DEFAULT_VOICE_ID)}"
+            ),
+        )
+
+    def quit_app(self, _):
+        self._stop_playback_process()
+        rumps.quit_application()
+
+
+if __name__ == "__main__":
+    install_exception_logging()
+    ClipboardReader().run()

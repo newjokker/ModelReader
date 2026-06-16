@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+releases/
+*.dmg
+.DS_Store
+
+
+icon.iconset/
+
+._*
+
+
