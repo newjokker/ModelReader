@@ -373,7 +373,8 @@ class ClipboardReader(rumps.App):
         ]
 
     def _rebuild_speed_menu(self):
-        self.speed_menu.clear()
+        if getattr(self.speed_menu, "_menu", None) is not None:
+            self.speed_menu.clear()
         current = normalize_speed(self.config.get("speed", DEFAULT_SPEED))
         for speed in [0.75, 0.9, 1.0, 1.1, 1.25, 1.5]:
             item = rumps.MenuItem(f"{speed:g}x", callback=self._menu_callback(f"语速 {speed:g}x", self.set_speed))
