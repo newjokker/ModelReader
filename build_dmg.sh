@@ -5,8 +5,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="/Users/jokkerling/.workbuddy/binaries/python/envs/default/bin/python"
+# PYTHON="/Users/jokkerling/.workbuddy/binaries/python/envs/default/bin/python"
+PYTHON="/Users/jokkerling/miniforge3/bin/python"
 APP_NAME="剪贴板朗读"
+export COPYFILE_DISABLE=1
 
 VERSION=$(grep '__version__' "$SCRIPT_DIR/app_version.py" | head -1 | sed 's/.*= "//;s/".*//')
 DMG_NAME="ClipboardReader-v${VERSION}.dmg"
@@ -20,6 +22,8 @@ if [ "$ARCH" != "arm64" ]; then
     exit 1
 fi
 echo "✅ Python 架构: $ARCH"
+PY_PREFIX=$($PYTHON -c 'import sys; print(sys.prefix)')
+echo "🐍 Python 环境: $PY_PREFIX"
 
 BUILD_DIR=$(mktemp -d "/tmp/clipboard_reader_build_XXXXXX")
 echo "📂 构建目录: $BUILD_DIR"
@@ -55,13 +59,44 @@ if [ ! -d "$BUILD_DIR/dist/$APP_NAME.app" ]; then
 fi
 echo "✅ .app 构建成功"
 
+APP_PATH="$BUILD_DIR/dist/$APP_NAME.app"
+
+echo "🔧 修复 py2app 动态库和签名..."
+FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+mkdir -p "$FRAMEWORKS_DIR"
+DYLIB_LIST="$BUILD_DIR/rpath_dylibs.txt"
+
+(
+find "$APP_PATH" -type f ! -name '._*' -print0 |
+    xargs -0 file |
+    awk -F: '/Mach-O/ {print $1}' |
+    while IFS= read -r binary; do
+        otool -L "$binary" 2>/dev/null |
+            awk '/@rpath\// {sub(/^.*@rpath\//, ""); print $1}'
+    done
+) | sort -u > "$DYLIB_LIST" || true
+
+while IFS= read -r dylib; do
+    SRC="$PY_PREFIX/lib/$dylib"
+    if [ -e "$SRC" ] && [ ! -e "$FRAMEWORKS_DIR/$dylib" ]; then
+        echo "   加入动态库: $dylib"
+        cp -L "$SRC" "$FRAMEWORKS_DIR/$dylib"
+    fi
+done < "$DYLIB_LIST"
+
+find "$APP_PATH" \( -name '._*' -o -name '.DS_Store' \) -delete
+xattr -cr "$APP_PATH"
+codesign --force --deep --sign - "$APP_PATH"
+codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+echo "✅ .app 签名验证通过"
+
 echo "💿 创建 DMG..."
 rm -f /tmp/clipboard_reader_template.dmg
 hdiutil create -size 200m -fs HFS+ -type UDIF -volname "$APP_NAME" /tmp/clipboard_reader_template.dmg
 hdiutil attach -nobrowse -mountpoint /tmp/clipboard_reader_mount /tmp/clipboard_reader_template.dmg
 
 echo "📦 打包 .app 到 DMG..."
-ditto "$BUILD_DIR/dist/$APP_NAME.app" "/tmp/clipboard_reader_mount/$APP_NAME.app"
+ditto --noextattr --norsrc "$APP_PATH" "/tmp/clipboard_reader_mount/$APP_NAME.app"
 ln -sf /Applications "/tmp/clipboard_reader_mount/Applications"
 cp "$BUILD_DIR/icon.icns" "/tmp/clipboard_reader_mount/.VolumeIcon.icns" 2>/dev/null || true
 /usr/bin/SetFile -a C "/tmp/clipboard_reader_mount"
