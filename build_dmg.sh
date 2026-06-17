@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # PYTHON="/Users/jokkerling/.workbuddy/binaries/python/envs/default/bin/python"
-PYTHON="/Users/jokkerling/miniforge3/bin/python"
+PYTHON="${PYTHON:-/Users/jokkerling/miniforge3/bin/python}"
 APP_NAME="剪贴板朗读"
 export COPYFILE_DISABLE=1
 

@@ -14,6 +14,10 @@ from clipboard_reader import (
     build_t2a_payload,
     enhance_text_for_tts,
     has_tts_markup,
+    mark_cache_record_failed,
+    normalize_config,
+    normalize_pitch,
+    normalize_volume,
     normalize_voice_id,
     save_audio,
     save_cache_record,
@@ -34,6 +38,33 @@ class ClipboardReaderTests(unittest.TestCase):
         self.assertEqual(normalize_speed(0.1), 0.5)
         self.assertEqual(normalize_speed(3), 2.0)
         self.assertEqual(normalize_speed("1.25"), 1.25)
+
+    def test_normalize_volume_and_pitch_clamp(self):
+        self.assertEqual(normalize_volume("bad"), 1.0)
+        self.assertEqual(normalize_volume(-1), 0.1)
+        self.assertEqual(normalize_volume(99), 10.0)
+        self.assertEqual(normalize_pitch("bad"), 0)
+        self.assertEqual(normalize_pitch(-99), -12)
+        self.assertEqual(normalize_pitch(99), 12)
+
+    def test_normalize_config_cleans_bad_values(self):
+        config = normalize_config(
+            {
+                "api_key": " key ",
+                "model": "",
+                "voice_id": "",
+                "speed": "nan",
+                "volume": "bad",
+                "pitch": "bad",
+                "enhancement_mode": "unknown",
+            }
+        )
+        self.assertEqual(config["api_key"], "key")
+        self.assertEqual(config["model"], DEFAULT_MODEL)
+        self.assertEqual(config["voice_id"], DEFAULT_VOICE_ID)
+        self.assertEqual(config["speed"], 1.0)
+        self.assertEqual(config["volume"], 1.0)
+        self.assertEqual(config["pitch"], 0)
 
     def test_build_t2a_payload_defaults(self):
         payload = build_t2a_payload("hello", {})
@@ -97,6 +128,8 @@ class ClipboardReaderTests(unittest.TestCase):
                     saved = json.load(f)
                 self.assertEqual(saved["texts"]["original"], "原文")
                 self.assertEqual(saved["texts"]["enhanced"], "增强<#0.4#>")
+                self.assertNotIn("tts_text", saved["texts"])
+                self.assertEqual(saved["tts"]["payload"]["text"], "增强<#0.4#>")
                 self.assertEqual(saved["tts"]["model"], "speech-2.8-hd")
                 self.assertEqual(saved["tts"]["voice_id"], "female-shaonv")
                 self.assertEqual(saved["tts"]["speed"], 1.25)
@@ -113,6 +146,27 @@ class ClipboardReaderTests(unittest.TestCase):
             sanitize_minimax_response(response),
             {"data": {"status": 2}, "base_resp": {"status_code": 0}},
         )
+
+    def test_mark_cache_record_failed_updates_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_record = clipboard_reader.RECORD_CACHE_DIR
+            old_audio = clipboard_reader.AUDIO_CACHE_DIR
+            try:
+                clipboard_reader.RECORD_CACHE_DIR = os.path.join(tmpdir, "Records")
+                clipboard_reader.AUDIO_CACHE_DIR = os.path.join(tmpdir, "Audio")
+                cache_id = "clipboard-20260617-093001-abcdef1234"
+                record = build_cache_record(cache_id, "原文", "增强", "增强", {}, "测试", False)
+
+                mark_cache_record_failed(record, RuntimeError("boom"))
+
+                with open(record["files"]["record"], encoding="utf-8") as f:
+                    saved = json.load(f)
+                self.assertEqual(saved["result"]["status"], "failed")
+                self.assertEqual(saved["result"]["error_type"], "RuntimeError")
+                self.assertEqual(saved["result"]["error"], "boom")
+            finally:
+                clipboard_reader.RECORD_CACHE_DIR = old_record
+                clipboard_reader.AUDIO_CACHE_DIR = old_audio
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ __bundle_id__ = "com.clipboardreader.app"
 import datetime
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -29,9 +30,11 @@ from app_version import __version__
 
 try:
     import AppKit
+    import Foundation
     import objc
 except Exception:
     AppKit = None
+    Foundation = None
     objc = None
 
 
@@ -98,6 +101,24 @@ else:
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def is_main_thread():
+    return Foundation is None or bool(Foundation.NSThread.isMainThread())
+
+
+def run_on_main_thread(func, *args, **kwargs):
+    if is_main_thread():
+        return func(*args, **kwargs)
+
+    def _call():
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            log_exception("主线程回调失败", e)
+
+    Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(_call)
+    return None
 
 
 def atomic_write_json(path, data):
@@ -173,6 +194,8 @@ def install_exception_logging():
 
 
 def safe_alert(**kwargs):
+    if not is_main_thread():
+        return run_on_main_thread(safe_alert, **kwargs)
     try:
         return rumps.alert(**kwargs)
     except Exception as e:
@@ -181,6 +204,8 @@ def safe_alert(**kwargs):
 
 
 def safe_notification(**kwargs):
+    if not is_main_thread():
+        return run_on_main_thread(safe_notification, **kwargs)
     try:
         rumps.notification(**kwargs)
     except Exception as e:
@@ -293,7 +318,41 @@ def normalize_speed(value):
         speed = float(value)
     except (TypeError, ValueError):
         return DEFAULT_SPEED
+    if not math.isfinite(speed):
+        return DEFAULT_SPEED
     return min(2.0, max(0.5, round(speed, 2)))
+
+
+def normalize_volume(value):
+    try:
+        volume = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_VOLUME
+    if not math.isfinite(volume):
+        return DEFAULT_VOLUME
+    return min(10.0, max(0.1, round(volume, 2)))
+
+
+def normalize_pitch(value):
+    try:
+        pitch = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PITCH
+    return min(12, max(-12, pitch))
+
+
+def normalize_config(config):
+    normalized = dict(config or {})
+    normalized["api_key"] = str(normalized.get("api_key", "") or "").strip()
+    normalized["model"] = str(normalized.get("model", DEFAULT_MODEL) or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    normalized["voice_id"] = normalize_voice_id(normalized.get("voice_id", DEFAULT_VOICE_ID))
+    normalized["speed"] = normalize_speed(normalized.get("speed", DEFAULT_SPEED))
+    normalized["volume"] = normalize_volume(normalized.get("volume", DEFAULT_VOLUME))
+    normalized["pitch"] = normalize_pitch(normalized.get("pitch", DEFAULT_PITCH))
+    normalized["enhancement_mode"] = normalize_enhancement_mode(
+        normalized.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE)
+    )
+    return normalized
 
 
 def get_clipboard_text():
@@ -322,8 +381,8 @@ def build_t2a_payload(text, config):
         "voice_setting": {
             "voice_id": normalize_voice_id(config.get("voice_id", DEFAULT_VOICE_ID)),
             "speed": normalize_speed(config.get("speed", DEFAULT_SPEED)),
-            "vol": float(config.get("volume", DEFAULT_VOLUME)),
-            "pitch": int(config.get("pitch", DEFAULT_PITCH)),
+            "vol": normalize_volume(config.get("volume", DEFAULT_VOLUME)),
+            "pitch": normalize_pitch(config.get("pitch", DEFAULT_PITCH)),
         },
         "audio_setting": {
             "sample_rate": 32000,
@@ -391,7 +450,6 @@ def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, sour
         "texts": {
             "original": normalize_text(raw_text),
             "enhanced": normalize_text(enhanced_text),
-            "tts_text": normalize_text(tts_text),
         },
         "tts": {
             "provider": "minimax",
@@ -428,6 +486,20 @@ def sanitize_minimax_response(response):
         else:
             sanitized[key] = value
     return sanitized
+
+
+def mark_cache_record_failed(record, error):
+    record["result"] = {
+        "status": "failed",
+        "failed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    try:
+        save_cache_record(record)
+    except OSError as cache_error:
+        log_exception("保存失败朗读记录缓存失败", cache_error)
+    return record
 
 
 def save_audio(audio_bytes, cache_id=None):
@@ -510,7 +582,7 @@ class ClipboardReader(rumps.App):
                     config.update(saved)
             except (json.JSONDecodeError, OSError) as e:
                 log_exception("加载配置失败", e)
-        return config
+        return normalize_config(config)
 
     def _save_config(self):
         try:
@@ -611,6 +683,9 @@ class ClipboardReader(rumps.App):
         self.voice_menu.add(rumps.MenuItem("自定义 Voice ID…", callback=self._menu_callback("自定义声音", self.set_custom_voice_id)))
 
     def _set_status(self, text):
+        if not is_main_thread():
+            run_on_main_thread(self._set_status, text)
+            return
         self.last_status = text
         self.status_item.title = f"状态: {text}"
         self.title = "🔊…" if self.busy else "🔊"
@@ -687,12 +762,16 @@ class ClipboardReader(rumps.App):
             safe_notification(title=__app_name__, subtitle="开始播放", message="MiniMax 语音已生成。")
         except Exception as e:
             log_exception("朗读剪贴板失败", e)
+            mark_cache_record_failed(cache_record, e)
             self._set_status("失败")
             safe_alert(title="朗读失败", message=f"{e}\n\n详情已写入错误日志。")
         finally:
-            self.busy = False
-            self.read_item.set_callback(self._menu_callback("朗读剪贴板", self.read_clipboard))
-            self.title = "🔊"
+            run_on_main_thread(self._finish_generation)
+
+    def _finish_generation(self):
+        self.busy = False
+        self.read_item.set_callback(self._menu_callback("朗读剪贴板", self.read_clipboard))
+        self.title = "🔊"
 
     def _start_playback(self, audio_path):
         self._stop_playback_process()
