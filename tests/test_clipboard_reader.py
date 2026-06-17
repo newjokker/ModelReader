@@ -3,10 +3,13 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import clipboard_reader
 from clipboard_reader import (
     DEFAULT_MODEL,
+    DEFAULT_TONE_LLM_BASE_URL,
+    DEFAULT_TONE_LLM_MODEL,
     DEFAULT_VOICE_ID,
     VOICE_PRESETS,
     build_cache_record,
@@ -65,6 +68,8 @@ class ClipboardReaderTests(unittest.TestCase):
         self.assertEqual(config["speed"], 1.0)
         self.assertEqual(config["volume"], 1.0)
         self.assertEqual(config["pitch"], 0)
+        self.assertEqual(config["tone_llm_model"], DEFAULT_TONE_LLM_MODEL)
+        self.assertEqual(config["tone_llm_base_url"], DEFAULT_TONE_LLM_BASE_URL)
 
     def test_build_t2a_payload_defaults(self):
         payload = build_t2a_payload("hello", {})
@@ -93,7 +98,51 @@ class ClipboardReaderTests(unittest.TestCase):
         enhanced = enhance_text_for_tts("等等，这里不对劲。线索终于出来了！", "auto")
         self.assertTrue(has_tts_markup(enhanced))
         self.assertIn("<#0.65#>", enhanced)
-        self.assertIn("(breath)", enhanced)
+        self.assertIn("(gasps)", enhanced)
+
+    def test_auto_enhancement_detects_tone_per_sentence(self):
+        enhanced = enhance_text_for_tts("他轻声说，没关系。突然，门外传来脚步声！太好了，我们成功了！", "auto")
+        self.assertIn("(breath) 他轻声说，没关系。", enhanced)
+        self.assertIn("(gasps) 突然，门外传来脚步声！", enhanced)
+        self.assertIn("太好了，我们成功了！<#0.45#> (laughs)", enhanced)
+
+    def test_auto_enhancement_can_use_llm_tones(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                body = {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "tones": [
+                                            {"index": 0, "tone": "sad"},
+                                            {"index": 1, "tone": "energetic"},
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+                return json.dumps(body).encode("utf-8")
+
+        metadata = {}
+        config = {"tone_llm_api_key": "llm-secret", "tone_llm_model": "tone-model"}
+        with mock.patch("urllib.request.urlopen", return_value=FakeResponse()):
+            enhanced = enhance_text_for_tts("他沉默着说对不起。太好了，我们成功了！", "auto", config, metadata)
+
+        self.assertIn("(sighs) 他沉默着说对不起。", enhanced)
+        self.assertIn("太好了，我们成功了！<#0.45#> (laughs)", enhanced)
+        self.assertEqual(metadata["tone_provider"], "llm")
+        self.assertEqual(metadata["tone_model"], "tone-model")
+        self.assertEqual(metadata["sentences"][0]["tone"], "sad")
 
     def test_cache_id_includes_timestamp_and_text_hash(self):
         cache_id = build_cache_id(" 你好 世界 ", datetime.datetime(2026, 6, 17, 9, 30, 1))
@@ -117,8 +166,17 @@ class ClipboardReaderTests(unittest.TestCase):
                     "volume": 0.8,
                     "pitch": 1,
                     "enhancement_mode": "gentle",
+                    "tone_llm_api_key": "llm-secret",
+                    "tone_llm_model": "tone-model",
+                    "tone_llm_base_url": "https://example.test/v1/chat/completions",
                 }
-                record = build_cache_record(cache_id, " 原文 ", "增强<#0.4#>", "增强<#0.4#>", config, "测试", False)
+                metadata = {
+                    "tone_provider": "llm",
+                    "tone_model": "tone-model",
+                    "tone_base_url": "https://example.test/v1/chat/completions",
+                    "sentences": [{"text": "原文", "tone": "gentle"}],
+                }
+                record = build_cache_record(cache_id, " 原文 ", "增强<#0.4#>", "增强<#0.4#>", config, "测试", False, metadata)
                 record_path = save_cache_record(record)
                 audio_path = save_audio(b"mp3", cache_id)
 
@@ -135,6 +193,9 @@ class ClipboardReaderTests(unittest.TestCase):
                 self.assertEqual(saved["tts"]["speed"], 1.25)
                 self.assertEqual(saved["tts"]["volume"], 0.8)
                 self.assertEqual(saved["tts"]["pitch"], 1)
+                self.assertEqual(saved["enhancement"]["tone_provider"], "llm")
+                self.assertEqual(saved["enhancement"]["tone_model"], "tone-model")
+                self.assertEqual(saved["enhancement"]["sentences"][0]["tone"], "gentle")
                 self.assertNotIn("secret", json.dumps(saved, ensure_ascii=False))
             finally:
                 clipboard_reader.RECORD_CACHE_DIR = old_record

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.10 - 2026-06-17
+
+- 将语气模型默认接口改为 DeepSeek Chat Completions：`https://api.deepseek.com/chat/completions`。
+- 将语气模型默认模型改为 `deepseek-v4-flash`，并支持通过 `DEEPSEEK_API_KEY` 读取 API Key。
+
+## 0.1.9 - 2026-06-17
+
+- 自动增强支持调用 OpenAI-compatible 语言模型逐句判断朗读语气，未配置或调用失败时自动回退本地规则。
+- 设置菜单新增「语气模型」，可配置 API Key、模型名和 `/chat/completions` 接口地址。
+- 朗读记录新增 `enhancement` 元数据，保存语气来源、语气模型信息和每句话的语气标注，不保存语气模型 API Key。
+
+## 0.1.8 - 2026-06-17
+
+- 自动增强改为逐句判断语气，同一段文字里可以分别识别温柔、悬疑、悲伤、新闻和坚定语气。
+- 每句会按识别结果插入更合适的 MiniMax 停顿和情绪标记，例如 `(breath)`、`(gasps)`、`(sighs)`、`(laughs)`。
+
 ## 0.1.7 - 2026-06-17
 
 - 将后台线程中的状态栏、通知、弹窗和菜单恢复操作派发到主线程，降低 macOS UI 偶发异常风险。

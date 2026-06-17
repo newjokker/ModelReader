@@ -41,6 +41,8 @@ except Exception:
 MINIMAX_T2A_URL = "https://api.minimax.io/v1/t2a_v2"
 DEFAULT_MODEL = "speech-2.8-turbo"
 DEFAULT_VOICE_ID = "male-qn-qingse"
+DEFAULT_TONE_LLM_BASE_URL = "https://api.deepseek.com/chat/completions"
+DEFAULT_TONE_LLM_MODEL = "deepseek-v4-flash"
 VOICE_PRESETS = [
     ("male-qn-qingse", "青涩男声"),
     ("male-qn-jingying", "精英男声"),
@@ -70,6 +72,37 @@ TTS_MARKUP_RE = re.compile(
     r"<#\d+(?:\.\d+)?#>|\((?:laughs|sighs|breath|exhale|gasps|emm)\)",
     re.IGNORECASE,
 )
+SENTENCE_TONE_RULES = [
+    (
+        "sad",
+        re.compile(r"难过|失去|离开|孤独|遗憾|哭|眼泪|沉默|抱歉|对不起|再也|最后一次"),
+    ),
+    (
+        "suspense",
+        re.compile(r"等等|不对劲|忽然|突然|安静|错误|藏|发现|线索|门外|脚步|危险|秘密|奇怪"),
+    ),
+    (
+        "gentle",
+        re.compile(r"没关系|别怕|放心|慢慢|温柔|照顾|珍贵|辛苦|累|谢谢|轻声"),
+    ),
+    (
+        "news",
+        re.compile(r"今天|上午|下午|消息|表示|目前|完成|发布|宣布|测试人员|数据显示|记者"),
+    ),
+    (
+        "energetic",
+        re.compile(r"成了|成功|太好了|漂亮|开工|继续|坚持|加油|一定|必须|现在就|立刻"),
+    ),
+]
+TONE_PAUSES = {
+    "gentle": "<#0.65#>",
+    "sad": "<#0.7#>",
+    "suspense": "<#0.65#>",
+    "news": "<#0.3#>",
+    "energetic": "<#0.35#>",
+    "plain": "<#0.4#>",
+}
+VALID_TONES = set(TONE_PAUSES)
 
 APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/ClipboardReader")
 CONFIG_FILE = os.path.join(APP_SUPPORT_DIR, "config.json")
@@ -249,6 +282,26 @@ def voice_preset_label(voice_id):
     return None
 
 
+def normalize_tone_llm_base_url(url):
+    url = str(url or "").strip()
+    return url or DEFAULT_TONE_LLM_BASE_URL
+
+
+def normalize_tone_llm_model(model):
+    model = str(model or "").strip()
+    return model or DEFAULT_TONE_LLM_MODEL
+
+
+def get_tone_llm_api_key(config):
+    return (
+        (config or {}).get("tone_llm_api_key")
+        or os.environ.get("TONE_LLM_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+
+
 def split_sentences(text):
     return [part.strip() for part in re.split(r"(?<=[。！？!?；;])\s*", text) if part.strip()]
 
@@ -258,58 +311,205 @@ def pause_for_sentence(sentence, mode):
         return "<#0.5#>"
     if sentence.endswith(("！", "!")):
         return "<#0.45#>"
-    if mode in {"gentle", "suspense"}:
-        return "<#0.65#>"
-    if mode == "news":
-        return "<#0.3#>"
-    return "<#0.4#>"
+    return TONE_PAUSES.get(mode, TONE_PAUSES["plain"])
 
 
-def detect_enhancement_mode(text):
-    if re.search(r"(^|\n)\s*[^:\n：]{1,8}[:：]", text):
+def detect_sentence_tone(sentence, fallback="plain"):
+    for tone, pattern in SENTENCE_TONE_RULES:
+        if pattern.search(sentence):
+            return tone
+    if re.search(r"(^|\n)\s*[^:\n：]{1,8}[:：]", sentence):
         return "energetic"
-    if re.search(r"等等|不对劲|忽然|突然|安静|错误|藏|发现|线索", text):
-        return "suspense"
-    if re.search(r"没关系|累|珍贵|离开|安静|温柔|慢慢|照顾", text):
-        return "gentle"
-    if re.search(r"今天|上午|消息|表示|目前|完成|发布|测试人员", text):
-        return "news"
-    if re.search(r"成了|成功|太好了|漂亮|开工|继续|坚持", text):
-        return "energetic"
-    return "plain"
+    return fallback if fallback in TONE_PAUSES else "plain"
 
 
-def enhance_paragraph(paragraph, mode):
+def emotion_marker_for_sentence(sentence, tone):
+    if tone == "sad":
+        return "(sighs) ", ""
+    if tone == "suspense":
+        if re.search(r"等等|不对劲|忽然|突然|危险|发现|线索|门外|脚步", sentence):
+            return "(gasps) ", ""
+        return "(breath) ", ""
+    if tone == "gentle":
+        return "(breath) ", ""
+    if tone == "energetic" and re.search(r"成了|成功|太好了|漂亮|加油", sentence):
+        return "", " (laughs)"
+    return "", ""
+
+
+def enhance_sentence(sentence, mode, tone=None):
+    tone = tone or (detect_sentence_tone(sentence) if mode == "auto" else mode)
+    if tone not in VALID_TONES:
+        tone = "plain"
+    prefix, suffix = emotion_marker_for_sentence(sentence, tone)
+    return f"{prefix}{sentence}{pause_for_sentence(sentence, tone)}{suffix}".strip()
+
+
+def _extract_json_object(text):
+    text = str(text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    if text.startswith("{"):
+        return json.loads(text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(text[start : end + 1])
+    raise ValueError("语气模型没有返回 JSON 对象")
+
+
+def post_tone_llm_chat_completion(base_url, api_key, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        base_url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def classify_sentence_tones_with_llm(sentences, config):
+    api_key = get_tone_llm_api_key(config)
+    if not api_key:
+        return None
+
+    base_url = normalize_tone_llm_base_url((config or {}).get("tone_llm_base_url"))
+    model = normalize_tone_llm_model((config or {}).get("tone_llm_model"))
+    sentence_items = [{"index": index, "text": sentence} for index, sentence in enumerate(sentences)]
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是朗读语气标注器。只判断每个句子的朗读语气，不改写文本。"
+                    "语气只能从 plain, gentle, suspense, sad, news, energetic 中选择。"
+                    "返回严格 JSON：{\"tones\":[{\"index\":0,\"tone\":\"plain\"}]}。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"sentences": sentence_items}, ensure_ascii=False),
+            },
+        ],
+    }
+    if "deepseek.com" in base_url or model.startswith("deepseek-v4-"):
+        payload["thinking"] = {"type": "disabled"}
+    try:
+        data = post_tone_llm_chat_completion(base_url, api_key, payload)
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 422):
+            raise
+        payload = dict(payload)
+        payload.pop("response_format", None)
+        data = post_tone_llm_chat_completion(base_url, api_key, payload)
+
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    parsed = _extract_json_object(content)
+    tones = ["plain"] * len(sentences)
+    for item in parsed.get("tones", []):
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        tone = str(item.get("tone", "")).strip()
+        if 0 <= index < len(tones) and tone in VALID_TONES:
+            tones[index] = tone
+    return {
+        "provider": "llm",
+        "model": model,
+        "base_url": base_url,
+        "tones": tones,
+    }
+
+
+def classify_sentence_tones(sentences, mode, config=None):
+    if mode != "auto":
+        return {
+            "provider": "forced",
+            "tones": [mode if mode in VALID_TONES else "plain" for _ in sentences],
+        }
+    try:
+        llm_result = classify_sentence_tones_with_llm(sentences, config or {})
+        if llm_result:
+            return llm_result
+    except Exception as e:
+        log_exception("语气模型判断失败，已回退到本地规则", e)
+    return {
+        "provider": "rules",
+        "tones": [detect_sentence_tone(sentence) for sentence in sentences],
+    }
+
+
+def enhance_sentences(sentences, mode, tones):
+    enhanced = []
+    for index, sentence in enumerate(sentences):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        enhanced.append(enhance_sentence(sentence, mode, tones[index]))
+    return "\n".join(enhanced).strip()
+
+
+def enhance_paragraph(paragraph, mode, config=None, metadata=None):
     sentences = split_sentences(paragraph)
     if not sentences:
         return paragraph.strip()
 
-    enhanced = []
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        enhanced.append(f"{sentence}{pause_for_sentence(sentence, mode)}")
+    tone_result = classify_sentence_tones(sentences, mode, config)
+    tones = tone_result["tones"]
+    if metadata is not None:
+        metadata.setdefault("tone_provider", tone_result.get("provider"))
+        if tone_result.get("model"):
+            metadata.setdefault("tone_model", tone_result.get("model"))
+        if tone_result.get("base_url"):
+            metadata.setdefault("tone_base_url", tone_result.get("base_url"))
+        metadata.setdefault("sentences", []).extend(
+            {"text": sentence, "tone": tones[index]} for index, sentence in enumerate(sentences)
+        )
 
-    text = "\n".join(enhanced).strip()
-    if mode == "gentle":
-        return f"(breath) {text}"
-    if mode == "suspense":
-        return f"{text}\n(breath)"
-    if mode == "energetic" and any(s.endswith(("！", "!")) for s in sentences):
-        return f"{text}\n(laughs)"
-    return text
+    return enhance_sentences(sentences, mode, tones)
 
 
-def enhance_text_for_tts(text, mode=DEFAULT_ENHANCEMENT_MODE):
+def enhance_text_for_tts(text, mode=DEFAULT_ENHANCEMENT_MODE, config=None, metadata=None):
     text = normalize_text(text)
     mode = normalize_enhancement_mode(mode)
     if not text or mode == "plain" or has_tts_markup(text):
+        if metadata is not None:
+            metadata["tone_provider"] = "none"
         return text
 
-    effective_mode = detect_enhancement_mode(text) if mode == "auto" else mode
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    enhanced = [enhance_paragraph(paragraph, effective_mode) for paragraph in paragraphs]
+    paragraph_sentences = [split_sentences(paragraph) for paragraph in paragraphs]
+    all_sentences = [sentence for sentences in paragraph_sentences for sentence in sentences]
+    if not all_sentences:
+        return text
+
+    tone_result = classify_sentence_tones(all_sentences, mode, config)
+    tones = tone_result["tones"]
+    if metadata is not None:
+        metadata["tone_provider"] = tone_result.get("provider")
+        if tone_result.get("model"):
+            metadata["tone_model"] = tone_result.get("model")
+        if tone_result.get("base_url"):
+            metadata["tone_base_url"] = tone_result.get("base_url")
+        metadata["sentences"] = [
+            {"text": sentence, "tone": tones[index]} for index, sentence in enumerate(all_sentences)
+        ]
+
+    enhanced = []
+    offset = 0
+    for sentences in paragraph_sentences:
+        enhanced.append(enhance_sentences(sentences, mode, tones[offset : offset + len(sentences)]))
+        offset += len(sentences)
     return "\n\n".join(enhanced)
 
 
@@ -351,6 +551,11 @@ def normalize_config(config):
     normalized["pitch"] = normalize_pitch(normalized.get("pitch", DEFAULT_PITCH))
     normalized["enhancement_mode"] = normalize_enhancement_mode(
         normalized.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE)
+    )
+    normalized["tone_llm_api_key"] = str(normalized.get("tone_llm_api_key", "") or "").strip()
+    normalized["tone_llm_model"] = normalize_tone_llm_model(normalized.get("tone_llm_model", DEFAULT_TONE_LLM_MODEL))
+    normalized["tone_llm_base_url"] = normalize_tone_llm_base_url(
+        normalized.get("tone_llm_base_url", DEFAULT_TONE_LLM_BASE_URL)
     )
     return normalized
 
@@ -437,7 +642,7 @@ def build_cache_id(raw_text, now=None):
     return f"clipboard-{timestamp}-{digest}"
 
 
-def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, source, was_trimmed):
+def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, source, was_trimmed, enhancement_metadata=None):
     payload = build_t2a_payload(tts_text, config)
     voice_setting = payload["voice_setting"]
     audio_setting = payload["audio_setting"]
@@ -450,6 +655,13 @@ def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, sour
         "texts": {
             "original": normalize_text(raw_text),
             "enhanced": normalize_text(enhanced_text),
+        },
+        "enhancement": {
+            "mode": normalize_enhancement_mode(config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE)),
+            "tone_provider": (enhancement_metadata or {}).get("tone_provider", "rules"),
+            "tone_model": (enhancement_metadata or {}).get("tone_model"),
+            "tone_base_url": (enhancement_metadata or {}).get("tone_base_url"),
+            "sentences": (enhancement_metadata or {}).get("sentences", []),
         },
         "tts": {
             "provider": "minimax",
@@ -573,6 +785,9 @@ class ClipboardReader(rumps.App):
             "volume": DEFAULT_VOLUME,
             "pitch": DEFAULT_PITCH,
             "enhancement_mode": DEFAULT_ENHANCEMENT_MODE,
+            "tone_llm_api_key": "",
+            "tone_llm_model": DEFAULT_TONE_LLM_MODEL,
+            "tone_llm_base_url": DEFAULT_TONE_LLM_BASE_URL,
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -615,6 +830,16 @@ class ClipboardReader(rumps.App):
         self._rebuild_speed_menu()
         self.enhancement_menu = rumps.MenuItem("朗读模式")
         self._rebuild_enhancement_menu()
+        self.tone_llm_menu = rumps.MenuItem("语气模型")
+        self.tone_llm_menu.add(
+            rumps.MenuItem("设置 API Key", callback=self._menu_callback("设置语气模型 API Key", self.set_tone_llm_api_key))
+        )
+        self.tone_llm_menu.add(
+            rumps.MenuItem("设置模型", callback=self._menu_callback("设置语气模型", self.set_tone_llm_model))
+        )
+        self.tone_llm_menu.add(
+            rumps.MenuItem("设置接口地址", callback=self._menu_callback("设置语气模型接口", self.set_tone_llm_base_url))
+        )
         self.launch_at_login_item = rumps.MenuItem("开机自启", callback=self._menu_callback("开机自启", self.toggle_launch_at_login))
         self._update_launch_at_login_item()
 
@@ -623,6 +848,7 @@ class ClipboardReader(rumps.App):
         self.settings_menu.add(self.model_item)
         self.settings_menu.add(self.speed_menu)
         self.settings_menu.add(self.enhancement_menu)
+        self.settings_menu.add(self.tone_llm_menu)
         self.settings_menu.add(None)
         self.settings_menu.add(self.launch_at_login_item)
 
@@ -709,26 +935,46 @@ class ClipboardReader(rumps.App):
         if not raw_text:
             safe_alert(title="没有可朗读文字", message="请先复制或选中一段文字。")
             return
-        mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
-        enhanced_text = enhance_text_for_tts(raw_text, mode)
-        text, was_trimmed = trim_text_for_tts(enhanced_text)
-        cache_id = build_cache_id(raw_text)
-        cache_record = build_cache_record(cache_id, raw_text, enhanced_text, text, self.config, source, was_trimmed)
-        try:
-            save_cache_record(cache_record)
-        except OSError as e:
-            log_exception("保存朗读记录缓存失败", e)
 
         self.busy = True
         self.read_item.set_callback(None)
-        self._set_status(f"生成中 · {source}")
+        self._set_status(f"分析语气 · {source}")
         self.worker = threading.Thread(
-            target=self._generate_and_play,
-            args=(text, was_trimmed, cache_id, cache_record),
+            target=self._prepare_generate_and_play,
+            args=(raw_text, source),
             name="MiniMaxTTSWorker",
             daemon=True,
         )
         self.worker.start()
+
+    def _prepare_generate_and_play(self, raw_text, source):
+        try:
+            mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
+            enhancement_metadata = {}
+            enhanced_text = enhance_text_for_tts(raw_text, mode, self.config, enhancement_metadata)
+            text, was_trimmed = trim_text_for_tts(enhanced_text)
+            cache_id = build_cache_id(raw_text)
+            cache_record = build_cache_record(
+                cache_id,
+                raw_text,
+                enhanced_text,
+                text,
+                self.config,
+                source,
+                was_trimmed,
+                enhancement_metadata,
+            )
+            try:
+                save_cache_record(cache_record)
+            except OSError as e:
+                log_exception("保存朗读记录缓存失败", e)
+            self._set_status(f"生成中 · {source}")
+            self._generate_and_play(text, was_trimmed, cache_id, cache_record)
+        except Exception as e:
+            log_exception("准备朗读失败", e)
+            self._set_status("失败")
+            safe_alert(title="朗读失败", message=f"{e}\n\n详情已写入错误日志。")
+            run_on_main_thread(self._finish_generation)
 
     def _register_services_provider(self):
         if _TextServiceProvider is None or AppKit is None:
@@ -845,6 +1091,51 @@ class ClipboardReader(rumps.App):
             self._save_config()
             self._set_status(f"模型: {self.config['model']}")
 
+    def set_tone_llm_api_key(self, _):
+        win = rumps.Window(
+            message="用于自动判断每句话语气。也可以不保存，改用环境变量 TONE_LLM_API_KEY 或 OPENAI_API_KEY。",
+            title="语气模型 API Key",
+            default_text=self.config.get("tone_llm_api_key", ""),
+            ok="保存",
+            cancel="取消",
+            dimensions=(460, 24),
+        )
+        response = win.run()
+        if response.clicked:
+            self.config["tone_llm_api_key"] = response.text.strip()
+            self._save_config()
+            self._set_status("语气模型 API Key 已保存")
+
+    def set_tone_llm_model(self, _):
+        win = rumps.Window(
+            message="OpenAI-compatible Chat Completions 模型名。",
+            title="语气模型",
+            default_text=normalize_tone_llm_model(self.config.get("tone_llm_model")),
+            ok="保存",
+            cancel="取消",
+            dimensions=(420, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            self.config["tone_llm_model"] = normalize_tone_llm_model(response.text)
+            self._save_config()
+            self._set_status(f"语气模型: {self.config['tone_llm_model']}")
+
+    def set_tone_llm_base_url(self, _):
+        win = rumps.Window(
+            message="OpenAI-compatible /chat/completions 接口地址。",
+            title="语气模型接口地址",
+            default_text=normalize_tone_llm_base_url(self.config.get("tone_llm_base_url")),
+            ok="保存",
+            cancel="取消",
+            dimensions=(520, 24),
+        )
+        response = win.run()
+        if response.clicked and response.text.strip():
+            self.config["tone_llm_base_url"] = normalize_tone_llm_base_url(response.text)
+            self._save_config()
+            self._set_status("语气模型接口已保存")
+
     def set_speed(self, sender):
         text = sender.title.replace("x", "")
         self.config["speed"] = normalize_speed(text)
@@ -888,7 +1179,8 @@ class ClipboardReader(rumps.App):
                 f"API Key 来源: {source}\n"
                 f"模型: {self.config.get('model', DEFAULT_MODEL)}\n"
                 f"声音: {self.config.get('voice_id', DEFAULT_VOICE_ID)}\n"
-                f"朗读模式: {ENHANCEMENT_MODES[normalize_enhancement_mode(self.config.get('enhancement_mode'))]}"
+                f"朗读模式: {ENHANCEMENT_MODES[normalize_enhancement_mode(self.config.get('enhancement_mode'))]}\n"
+                f"语气模型: {normalize_tone_llm_model(self.config.get('tone_llm_model'))}"
             ),
         )
 
