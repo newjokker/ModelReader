@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.12 - 2026-06-17
+
+- 语气模型改为逐句给出 `speed` 和 `pitch` 建议，并在朗读记录中保存到每句话条目里。
+- 实际 TTS 请求会把逐句建议汇总为整段 `speed` 和 `pitch`；`volume` 保持用户设置，不再由 AI 调整。
+
+## 0.1.11 - 2026-06-17
+
+- 语气模型现在会同时建议本次朗读的语速、音量和音调，并应用到实际 MiniMax TTS payload。
+- AI 建议的声音参数会经过范围清洗，只影响本次朗读，不覆盖用户保存的默认设置。
+- 朗读记录的 `enhancement.voice_adjustments` 会保存本次 AI 声音参数调整，方便复现。
+
 ## 0.1.10 - 2026-06-17
 
 - 将语气模型默认接口改为 DeepSeek Chat Completions：`https://api.deepseek.com/chat/completions`。

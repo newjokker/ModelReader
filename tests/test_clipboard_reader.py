@@ -15,6 +15,7 @@ from clipboard_reader import (
     build_cache_record,
     build_cache_id,
     build_t2a_payload,
+    config_with_voice_adjustments,
     enhance_text_for_tts,
     has_tts_markup,
     mark_cache_record_failed,
@@ -121,10 +122,10 @@ class ClipboardReaderTests(unittest.TestCase):
                             "message": {
                                 "content": json.dumps(
                                     {
-                                        "tones": [
-                                            {"index": 0, "tone": "sad"},
-                                            {"index": 1, "tone": "energetic"},
-                                        ]
+                                        "sentences": [
+                                            {"index": 0, "tone": "sad", "speed": 0.8, "pitch": -3},
+                                            {"index": 1, "tone": "energetic", "speed": 1.4, "pitch": 2},
+                                        ],
                                     }
                                 )
                             }
@@ -143,6 +144,24 @@ class ClipboardReaderTests(unittest.TestCase):
         self.assertEqual(metadata["tone_provider"], "llm")
         self.assertEqual(metadata["tone_model"], "tone-model")
         self.assertEqual(metadata["sentences"][0]["tone"], "sad")
+        self.assertEqual(metadata["sentences"][0]["speed"], 0.8)
+        self.assertEqual(metadata["sentences"][1]["pitch"], 2)
+        self.assertEqual(metadata["voice_adjustments"], {"speed": 1.1, "pitch": 0})
+
+    def test_voice_adjustments_are_applied_to_tts_payload(self):
+        config = {
+            "model": "speech-2.8-hd",
+            "voice_id": "female-shaonv",
+            "speed": 1.0,
+            "volume": 1.0,
+            "pitch": 0,
+        }
+        adjusted = config_with_voice_adjustments(config, {"speed": 3, "volume": "0.5", "pitch": -99})
+        payload = build_t2a_payload("hello", adjusted)
+
+        self.assertEqual(payload["voice_setting"]["speed"], 2.0)
+        self.assertEqual(payload["voice_setting"]["vol"], 1.0)
+        self.assertEqual(payload["voice_setting"]["pitch"], -12)
 
     def test_cache_id_includes_timestamp_and_text_hash(self):
         cache_id = build_cache_id(" 你好 世界 ", datetime.datetime(2026, 6, 17, 9, 30, 1))
@@ -174,9 +193,20 @@ class ClipboardReaderTests(unittest.TestCase):
                     "tone_provider": "llm",
                     "tone_model": "tone-model",
                     "tone_base_url": "https://example.test/v1/chat/completions",
-                    "sentences": [{"text": "原文", "tone": "gentle"}],
+                    "voice_adjustments": {"speed": 1.35, "pitch": -1},
+                    "sentences": [{"text": "原文", "tone": "gentle", "speed": 1.35, "pitch": -1}],
                 }
-                record = build_cache_record(cache_id, " 原文 ", "增强<#0.4#>", "增强<#0.4#>", config, "测试", False, metadata)
+                effective_config = config_with_voice_adjustments(config, metadata["voice_adjustments"])
+                record = build_cache_record(
+                    cache_id,
+                    " 原文 ",
+                    "增强<#0.4#>",
+                    "增强<#0.4#>",
+                    effective_config,
+                    "测试",
+                    False,
+                    metadata,
+                )
                 record_path = save_cache_record(record)
                 audio_path = save_audio(b"mp3", cache_id)
 
@@ -190,11 +220,13 @@ class ClipboardReaderTests(unittest.TestCase):
                 self.assertEqual(saved["tts"]["payload"]["text"], "增强<#0.4#>")
                 self.assertEqual(saved["tts"]["model"], "speech-2.8-hd")
                 self.assertEqual(saved["tts"]["voice_id"], "female-shaonv")
-                self.assertEqual(saved["tts"]["speed"], 1.25)
+                self.assertEqual(saved["tts"]["speed"], 1.35)
                 self.assertEqual(saved["tts"]["volume"], 0.8)
-                self.assertEqual(saved["tts"]["pitch"], 1)
+                self.assertEqual(saved["tts"]["pitch"], -1)
                 self.assertEqual(saved["enhancement"]["tone_provider"], "llm")
                 self.assertEqual(saved["enhancement"]["tone_model"], "tone-model")
+                self.assertEqual(saved["enhancement"]["voice_adjustments"]["speed"], 1.35)
+                self.assertNotIn("volume", saved["enhancement"]["voice_adjustments"])
                 self.assertEqual(saved["enhancement"]["sentences"][0]["tone"], "gentle")
                 self.assertNotIn("secret", json.dumps(saved, ensure_ascii=False))
             finally:

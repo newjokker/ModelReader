@@ -390,9 +390,11 @@ def classify_sentence_tones_with_llm(sentences, config):
             {
                 "role": "system",
                 "content": (
-                    "你是朗读语气标注器。只判断每个句子的朗读语气，不改写文本。"
+                    "你是朗读导演。请结合整段上下文判断每个句子的朗读语气、语速和音调，不改写文本。"
                     "语气只能从 plain, gentle, suspense, sad, news, energetic 中选择。"
-                    "返回严格 JSON：{\"tones\":[{\"index\":0,\"tone\":\"plain\"}]}。"
+                    "每句 speed 范围 0.5 到 2.0，pitch 范围 -12 到 12。不要返回音量。"
+                    "返回严格 JSON："
+                    "{\"sentences\":[{\"index\":0,\"tone\":\"plain\",\"speed\":1.0,\"pitch\":0}]}。"
                 ),
             },
             {
@@ -415,7 +417,9 @@ def classify_sentence_tones_with_llm(sentences, config):
     content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
     parsed = _extract_json_object(content)
     tones = ["plain"] * len(sentences)
-    for item in parsed.get("tones", []):
+    sentence_adjustments = [{} for _ in sentences]
+    parsed_sentences = parsed.get("sentences") or parsed.get("tones") or []
+    for item in parsed_sentences:
         try:
             index = int(item.get("index"))
         except (TypeError, ValueError):
@@ -423,11 +427,15 @@ def classify_sentence_tones_with_llm(sentences, config):
         tone = str(item.get("tone", "")).strip()
         if 0 <= index < len(tones) and tone in VALID_TONES:
             tones[index] = tone
+            sentence_adjustments[index] = normalize_voice_adjustments(item)
+    voice_adjustments = aggregate_voice_adjustments(sentence_adjustments)
     return {
         "provider": "llm",
         "model": model,
         "base_url": base_url,
         "tones": tones,
+        "sentence_voice_adjustments": sentence_adjustments,
+        "voice_adjustments": voice_adjustments,
     }
 
 
@@ -436,6 +444,8 @@ def classify_sentence_tones(sentences, mode, config=None):
         return {
             "provider": "forced",
             "tones": [mode if mode in VALID_TONES else "plain" for _ in sentences],
+            "sentence_voice_adjustments": [{} for _ in sentences],
+            "voice_adjustments": {},
         }
     try:
         llm_result = classify_sentence_tones_with_llm(sentences, config or {})
@@ -446,6 +456,8 @@ def classify_sentence_tones(sentences, mode, config=None):
     return {
         "provider": "rules",
         "tones": [detect_sentence_tone(sentence) for sentence in sentences],
+        "sentence_voice_adjustments": [{} for _ in sentences],
+        "voice_adjustments": {},
     }
 
 
@@ -466,14 +478,21 @@ def enhance_paragraph(paragraph, mode, config=None, metadata=None):
 
     tone_result = classify_sentence_tones(sentences, mode, config)
     tones = tone_result["tones"]
+    sentence_voice_adjustments = tone_result.get("sentence_voice_adjustments") or [{} for _ in sentences]
     if metadata is not None:
         metadata.setdefault("tone_provider", tone_result.get("provider"))
         if tone_result.get("model"):
             metadata.setdefault("tone_model", tone_result.get("model"))
         if tone_result.get("base_url"):
             metadata.setdefault("tone_base_url", tone_result.get("base_url"))
+        metadata.setdefault("voice_adjustments", tone_result.get("voice_adjustments", {}))
         metadata.setdefault("sentences", []).extend(
-            {"text": sentence, "tone": tones[index]} for index, sentence in enumerate(sentences)
+            {
+                "text": sentence,
+                "tone": tones[index],
+                **normalize_voice_adjustments(sentence_voice_adjustments[index]),
+            }
+            for index, sentence in enumerate(sentences)
         )
 
     return enhance_sentences(sentences, mode, tones)
@@ -495,14 +514,21 @@ def enhance_text_for_tts(text, mode=DEFAULT_ENHANCEMENT_MODE, config=None, metad
 
     tone_result = classify_sentence_tones(all_sentences, mode, config)
     tones = tone_result["tones"]
+    sentence_voice_adjustments = tone_result.get("sentence_voice_adjustments") or [{} for _ in all_sentences]
     if metadata is not None:
         metadata["tone_provider"] = tone_result.get("provider")
         if tone_result.get("model"):
             metadata["tone_model"] = tone_result.get("model")
         if tone_result.get("base_url"):
             metadata["tone_base_url"] = tone_result.get("base_url")
+        metadata["voice_adjustments"] = tone_result.get("voice_adjustments", {})
         metadata["sentences"] = [
-            {"text": sentence, "tone": tones[index]} for index, sentence in enumerate(all_sentences)
+            {
+                "text": sentence,
+                "tone": tones[index],
+                **normalize_voice_adjustments(sentence_voice_adjustments[index]),
+            }
+            for index, sentence in enumerate(all_sentences)
         ]
 
     enhanced = []
@@ -539,6 +565,41 @@ def normalize_pitch(value):
     except (TypeError, ValueError):
         return DEFAULT_PITCH
     return min(12, max(-12, pitch))
+
+
+def normalize_voice_adjustments(adjustments):
+    if not isinstance(adjustments, dict):
+        return {}
+    normalized = {}
+    if "speed" in adjustments:
+        normalized["speed"] = normalize_speed(adjustments.get("speed"))
+    if "pitch" in adjustments:
+        normalized["pitch"] = normalize_pitch(adjustments.get("pitch"))
+    return normalized
+
+
+def aggregate_voice_adjustments(sentence_adjustments):
+    speed_values = []
+    pitch_values = []
+    for adjustments in sentence_adjustments or []:
+        normalized = normalize_voice_adjustments(adjustments)
+        if "speed" in normalized:
+            speed_values.append(normalized["speed"])
+        if "pitch" in normalized:
+            pitch_values.append(normalized["pitch"])
+    aggregated = {}
+    if speed_values:
+        aggregated["speed"] = normalize_speed(sum(speed_values) / len(speed_values))
+    if pitch_values:
+        aggregated["pitch"] = normalize_pitch(round(sum(pitch_values) / len(pitch_values)))
+    return aggregated
+
+
+def config_with_voice_adjustments(config, adjustments):
+    adjusted = normalize_config(config)
+    for key, value in normalize_voice_adjustments(adjustments).items():
+        adjusted[key] = value
+    return adjusted
 
 
 def normalize_config(config):
@@ -661,6 +722,7 @@ def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, sour
             "tone_provider": (enhancement_metadata or {}).get("tone_provider", "rules"),
             "tone_model": (enhancement_metadata or {}).get("tone_model"),
             "tone_base_url": (enhancement_metadata or {}).get("tone_base_url"),
+            "voice_adjustments": (enhancement_metadata or {}).get("voice_adjustments", {}),
             "sentences": (enhancement_metadata or {}).get("sentences", []),
         },
         "tts": {
@@ -952,6 +1014,10 @@ class ClipboardReader(rumps.App):
             mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
             enhancement_metadata = {}
             enhanced_text = enhance_text_for_tts(raw_text, mode, self.config, enhancement_metadata)
+            effective_config = config_with_voice_adjustments(
+                self.config,
+                enhancement_metadata.get("voice_adjustments"),
+            )
             text, was_trimmed = trim_text_for_tts(enhanced_text)
             cache_id = build_cache_id(raw_text)
             cache_record = build_cache_record(
@@ -959,7 +1025,7 @@ class ClipboardReader(rumps.App):
                 raw_text,
                 enhanced_text,
                 text,
-                self.config,
+                effective_config,
                 source,
                 was_trimmed,
                 enhancement_metadata,
@@ -969,7 +1035,7 @@ class ClipboardReader(rumps.App):
             except OSError as e:
                 log_exception("保存朗读记录缓存失败", e)
             self._set_status(f"生成中 · {source}")
-            self._generate_and_play(text, was_trimmed, cache_id, cache_record)
+            self._generate_and_play(text, was_trimmed, cache_id, cache_record, effective_config)
         except Exception as e:
             log_exception("准备朗读失败", e)
             self._set_status("失败")
@@ -988,11 +1054,11 @@ class ClipboardReader(rumps.App):
         except Exception as e:
             log_exception("注册右键服务失败", e)
 
-    def _generate_and_play(self, text, was_trimmed, cache_id, cache_record):
+    def _generate_and_play(self, text, was_trimmed, cache_id, cache_record, config):
         try:
             if was_trimmed:
                 safe_notification(title=__app_name__, subtitle="文本过长", message="已截取前 10000 个字符朗读。")
-            audio_bytes, response = minimax_t2a(text, self.config)
+            audio_bytes, response = minimax_t2a(text, config)
             audio_path = save_audio(audio_bytes, cache_id)
             cache_record["files"]["audio"] = audio_path
             cache_record["result"] = {
