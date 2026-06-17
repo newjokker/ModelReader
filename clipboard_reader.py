@@ -10,6 +10,7 @@ __app_name__ = "📋 剪贴板朗读"
 __bundle_id__ = "com.clipboardreader.app"
 
 import datetime
+import hashlib
 import json
 import os
 import plistlib
@@ -70,6 +71,7 @@ TTS_MARKUP_RE = re.compile(
 APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/ClipboardReader")
 CONFIG_FILE = os.path.join(APP_SUPPORT_DIR, "config.json")
 AUDIO_CACHE_DIR = os.path.join(APP_SUPPORT_DIR, "Audio")
+RECORD_CACHE_DIR = os.path.join(APP_SUPPORT_DIR, "Records")
 ERROR_LOG_DIR = os.path.expanduser("~/Library/Logs/ClipboardReader")
 ERROR_LOG_FILE = os.path.join(ERROR_LOG_DIR, "error.log")
 LAUNCH_AGENT_LABEL = __bundle_id__
@@ -368,10 +370,71 @@ def minimax_t2a(text, config):
     return bytes.fromhex(audio_hex), data
 
 
-def save_audio(audio_bytes):
+def build_cache_id(raw_text, now=None):
+    if now is None:
+        now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d-%H%M%S")
+    digest = hashlib.sha256(normalize_text(raw_text).encode("utf-8")).hexdigest()[:10]
+    return f"clipboard-{timestamp}-{digest}"
+
+
+def build_cache_record(cache_id, raw_text, enhanced_text, tts_text, config, source, was_trimmed):
+    payload = build_t2a_payload(tts_text, config)
+    voice_setting = payload["voice_setting"]
+    audio_setting = payload["audio_setting"]
+    return {
+        "cache_id": cache_id,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "app_version": __version__,
+        "source": source,
+        "was_trimmed": bool(was_trimmed),
+        "texts": {
+            "original": normalize_text(raw_text),
+            "enhanced": normalize_text(enhanced_text),
+            "tts_text": normalize_text(tts_text),
+        },
+        "tts": {
+            "provider": "minimax",
+            "endpoint": MINIMAX_T2A_URL,
+            "model": payload["model"],
+            "voice_id": voice_setting["voice_id"],
+            "speed": voice_setting["speed"],
+            "volume": voice_setting["vol"],
+            "pitch": voice_setting["pitch"],
+            "enhancement_mode": normalize_enhancement_mode(config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE)),
+            "language_boost": payload["language_boost"],
+            "audio_setting": audio_setting,
+            "payload": payload,
+        },
+        "files": {
+            "record": os.path.join(RECORD_CACHE_DIR, f"{cache_id}.json"),
+            "audio": os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.mp3"),
+        },
+        "result": None,
+    }
+
+
+def save_cache_record(record):
+    path = record["files"]["record"]
+    atomic_write_json(path, record)
+    return path
+
+
+def sanitize_minimax_response(response):
+    sanitized = {}
+    for key, value in (response or {}).items():
+        if key == "data" and isinstance(value, dict):
+            sanitized[key] = {k: v for k, v in value.items() if k != "audio"}
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def save_audio(audio_bytes, cache_id=None):
     ensure_dir(AUDIO_CACHE_DIR)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(AUDIO_CACHE_DIR, f"clipboard-{timestamp}.mp3")
+    if cache_id is None:
+        cache_id = build_cache_id("")
+    path = os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.mp3")
     with open(path, "wb") as f:
         f.write(audio_bytes)
     return path
@@ -491,7 +554,7 @@ class ClipboardReader(rumps.App):
         self.settings_menu.add(None)
         self.settings_menu.add(self.launch_at_login_item)
 
-        self.open_cache_item = rumps.MenuItem("打开音频缓存", callback=self._menu_callback("打开音频缓存", self.open_audio_cache))
+        self.open_cache_item = rumps.MenuItem("打开缓存目录", callback=self._menu_callback("打开缓存目录", self.open_cache_dir))
         self.open_logs_item = rumps.MenuItem("打开错误日志", callback=self._menu_callback("打开错误日志", self.open_error_logs))
 
         self.menu = [
@@ -574,13 +637,19 @@ class ClipboardReader(rumps.App):
         mode = normalize_enhancement_mode(self.config.get("enhancement_mode", DEFAULT_ENHANCEMENT_MODE))
         enhanced_text = enhance_text_for_tts(raw_text, mode)
         text, was_trimmed = trim_text_for_tts(enhanced_text)
+        cache_id = build_cache_id(raw_text)
+        cache_record = build_cache_record(cache_id, raw_text, enhanced_text, text, self.config, source, was_trimmed)
+        try:
+            save_cache_record(cache_record)
+        except OSError as e:
+            log_exception("保存朗读记录缓存失败", e)
 
         self.busy = True
         self.read_item.set_callback(None)
         self._set_status(f"生成中 · {source}")
         self.worker = threading.Thread(
             target=self._generate_and_play,
-            args=(text, was_trimmed),
+            args=(text, was_trimmed, cache_id, cache_record),
             name="MiniMaxTTSWorker",
             daemon=True,
         )
@@ -598,12 +667,19 @@ class ClipboardReader(rumps.App):
         except Exception as e:
             log_exception("注册右键服务失败", e)
 
-    def _generate_and_play(self, text, was_trimmed):
+    def _generate_and_play(self, text, was_trimmed, cache_id, cache_record):
         try:
             if was_trimmed:
                 safe_notification(title=__app_name__, subtitle="文本过长", message="已截取前 10000 个字符朗读。")
             audio_bytes, response = minimax_t2a(text, self.config)
-            audio_path = save_audio(audio_bytes)
+            audio_path = save_audio(audio_bytes, cache_id)
+            cache_record["files"]["audio"] = audio_path
+            cache_record["result"] = {
+                "status": "success",
+                "audio_bytes": len(audio_bytes),
+                "response": sanitize_minimax_response(response),
+            }
+            save_cache_record(cache_record)
             self.last_audio_path = audio_path
             self._start_playback(audio_path)
             usage = (response.get("extra_info") or {}).get("usage_characters", len(text))
@@ -714,9 +790,10 @@ class ClipboardReader(rumps.App):
     def _update_launch_at_login_item(self):
         self.launch_at_login_item.state = is_launch_agent_enabled()
 
-    def open_audio_cache(self, _):
+    def open_cache_dir(self, _):
+        ensure_dir(RECORD_CACHE_DIR)
         ensure_dir(AUDIO_CACHE_DIR)
-        subprocess.run(["open", AUDIO_CACHE_DIR], check=False)
+        subprocess.run(["open", APP_SUPPORT_DIR], check=False)
 
     def open_error_logs(self, _):
         ensure_dir(ERROR_LOG_DIR)
